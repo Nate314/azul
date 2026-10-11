@@ -32,9 +32,11 @@ function current(manager: Manager): PublicGameState {
   return state;
 }
 
-// A move that is always legal: the first tile of the first factory, to the floor
+// A move that is always legal: one colour from the first pile with tiles, to the floor
 function anyMove(state: PublicGameState): Move {
-  return { source: { type: 'factory', index: 0 }, color: state.factories[0][0], line: 'floor' };
+  const index = state.factories.findIndex(tiles => tiles.length > 0);
+  if (index < 0) return { source: { type: 'center' }, color: state.center[0], line: 'floor' };
+  return { source: { type: 'factory', index }, color: state.factories[index][0], line: 'floor' };
 }
 
 test('join trims the game ID and name and rejects blanks', () => {
@@ -109,4 +111,110 @@ test('leaving mid-game hands the win to the last player', () => {
   assert.equal(state.isGameOver, true);
   assert.deepEqual(state.winners, [1]);
   assert.deepEqual(manager.move('g1', 1, anyMove(state)), { error: 'The game is over' });
+});
+
+// Plays legal moves, in turn, until the round has been scored
+function playRound(manager: Manager): PublicGameState {
+  let state = current(manager);
+  while (!state.roundSummary) {
+    if (state.currentPlayer === null) assert.fail('nobody to move');
+    state = ok(manager.move('g1', state.currentPlayer, anyMove(state)));
+  }
+  return state;
+}
+
+test('the next round waits for every player to acknowledge the summary', () => {
+  const manager = gameWith('A', 'B');
+  assert.deepEqual(manager.acknowledge('g1', 1), { error: 'Nothing to continue' });
+
+  const scored = playRound(manager);
+  assert.equal(scored.round, 1);
+  assert.equal(scored.currentPlayer, null);
+  assert.deepEqual(Object.keys(scored.roundSummary?.seats ?? {}), ['1', '2']);
+  assert.deepEqual(manager.acknowledge('g1', 3), { error: 'You are not in this game' });
+
+  const waiting = ok(manager.acknowledge('g1', 1));
+  assert.deepEqual(waiting.roundSummary?.acknowledged, [1]);
+  assert.equal(waiting.round, 1);
+
+  const next = ok(manager.acknowledge('g1', 2));
+  assert.equal(next.roundSummary, null);
+  assert.equal(next.round, 2);
+  assert.equal(next.factories.flat().length, 20);
+  assert.equal('bag' in next, false);
+});
+
+test('an undo approved by everyone restores the previous turn', () => {
+  const manager = gameWith('A', 'B');
+  assert.equal(current(manager).undoAvailable, false);
+  assert.deepEqual(manager.requestUndo('g1', 1), { error: 'Nothing to undo' });
+
+  const before = current(manager);
+  assert.equal(ok(manager.move('g1', 1, anyMove(before))).undoAvailable, true);
+
+  const voting = ok(manager.requestUndo('g1', 2));
+  assert.deepEqual(voting.undoVote, { requestedBy: 2, votes: { 2: true } });
+  assert.equal(voting.gameStatus, 'B wants to undo the last turn');
+  assert.deepEqual(manager.requestUndo('g1', 1), { error: 'An undo vote is already in progress' });
+  assert.deepEqual(manager.move('g1', 2, anyMove(voting)), { error: 'An undo vote is in progress' });
+  assert.deepEqual(manager.voteUndo('g1', 2, true), { error: 'You already voted' });
+
+  const restored = ok(manager.voteUndo('g1', 1, true));
+  assert.equal(restored.undoVote, null);
+  assert.equal(restored.undoAvailable, false);
+  assert.equal(restored.currentPlayer, 1);
+  assert.equal(restored.started, true); // joining stays closed
+  assert.equal(restored.gameStatus, 'Last turn undone');
+  assert.deepEqual(restored.factories, before.factories);
+  assert.deepEqual(restored.boards, before.boards);
+  assert.deepEqual(manager.voteUndo('g1', 1, true), { error: 'No undo vote in progress' });
+  assert.deepEqual(manager.requestUndo('g1', 1), { error: 'Nothing to undo' });
+});
+
+test('one decline cancels the undo', () => {
+  const manager = gameWith('A', 'B', 'C');
+  const moved = ok(manager.move('g1', 1, anyMove(current(manager))));
+  ok(manager.requestUndo('g1', 1));
+  ok(manager.voteUndo('g1', 2, true));
+  const declined = ok(manager.voteUndo('g1', 3, 'yes')); // anything but true is a decline
+  assert.equal(declined.undoVote, null);
+  assert.equal(declined.gameStatus, 'C declined the undo');
+  assert.deepEqual(declined.boards, moved.boards);
+  assert.equal(declined.currentPlayer, 2);
+  assert.equal(declined.undoAvailable, true);
+});
+
+test('a player leaving during a vote no longer counts', () => {
+  const manager = gameWith('A', 'B', 'C');
+  const before = current(manager);
+  ok(manager.move('g1', 1, anyMove(before)));
+  ok(manager.requestUndo('g1', 1));
+  ok(manager.voteUndo('g1', 2, true));
+  const state = left(manager.leave('g1', 3));
+  assert.equal(state.undoVote, null);
+  assert.equal(state.gameStatus, 'Last turn undone');
+  assert.deepEqual(state.factories, before.factories);
+  assert.equal(state.currentPlayer, 1);
+});
+
+test('undoing the move that ended a round brings the round back', () => {
+  const manager = gameWith('A', 'B');
+  const scored = playRound(manager);
+  assert.ok(scored.roundSummary);
+  ok(manager.requestUndo('g1', 1));
+  const restored = ok(manager.voteUndo('g1', 2, true));
+  assert.equal(restored.roundSummary, null);
+  assert.equal(restored.round, 1);
+  assert.notEqual(restored.currentPlayer, null);
+  assert.ok(restored.center.length + restored.factories.flat().length > 0);
+
+  // And after the next round has been dealt
+  playRound(manager);
+  ok(manager.acknowledge('g1', 1));
+  assert.equal(ok(manager.acknowledge('g1', 2)).round, 2);
+  ok(manager.requestUndo('g1', 2));
+  const back = ok(manager.voteUndo('g1', 1, true));
+  assert.equal(back.round, 1);
+  assert.equal(back.roundSummary, null);
+  assert.equal(playRound(manager).round, 1);
 });

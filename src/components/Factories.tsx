@@ -54,7 +54,12 @@ export default function Factories({ gameState, isMyTurn, selection, onSelect }: 
       <div className={pileClass('center', CENTER)}>
         <span className="center-label">Centre</span>
         {centerHasMarker && <Tile kind="first" />}
-        {renderTiles(CENTER, center)}
+        {/* One group per colour: a group moves to the next row whole instead of wrapping */}
+        {COLORS.filter(color => center.includes(color)).map(color => (
+          <span key={color} className="center-group">
+            {renderTiles(CENTER, center.filter(tile => tile === color))}
+          </span>
+        ))}
       </div>
     </div>
   );

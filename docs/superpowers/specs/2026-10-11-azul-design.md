@@ -14,7 +14,7 @@ packaging. Rules follow the standard game as summarised at https://buddyboardgam
   Dockerfile, `docker-compose.yml`, `compose-launcher` submodule, `run.sh` / `run.ps1` stubs,
   `run.conf`, GitHub Actions CI, ESLint, `.nvmrc`.
 - Two to four players, seated in join order. Joining locks after the first move.
-- No undo feature.
+- No undo feature. (Reversed later; see "Changes after the first version".)
 
 ## Out of scope
 
@@ -240,6 +240,28 @@ show the same way as in Quoridor.
   start, moves by the wrong player, the public state has no bag or lid, leaving.
 
 The UI is checked by running the server and playing a game in the browser across two windows.
+
+## Changes after the first version
+
+Added on 2026-10-11, after the first playable version. Where these differ from the sections
+above, these win.
+
+- **Board order.** Boards are shown in turn order starting with the viewer's own, so on every
+  screen play passes to the board on the right.
+- **Round summary.** The move that empties the table scores the round but does not deal the next
+  one. The state carries `roundSummary`: for each board, the tiles placed with their points and
+  the row and column runs behind them, the floor line and its penalty, and the score before and
+  after. `currentPlayer` is null until every player still in the game has sent
+  `ACKNOWLEDGE_ROUND`; then the next round is dealt. A player who leaves no longer holds it up.
+  At the end of the game the summary also carries each board's bonuses and needs no
+  acknowledgement.
+- **Undo.** The same as Quoridor: `REQUEST_UNDO` opens a vote, `VOTE_UNDO` approves or declines,
+  and the last turn is undone only if every player still in the game approves. The server keeps
+  the full state from before each move, so undoing the move that ended a round brings the round
+  back, even after the next one was dealt. Moves and acknowledgements wait while a vote is open.
+- **Centre.** Tiles in the centre are grouped by colour. A group never wraps: if it does not fit
+  on the current row, the whole group moves to the next row.
+- **FAQ.** A button at the top of every screen opens a short guide to the rules and controls.
 
 ## Delivery
 

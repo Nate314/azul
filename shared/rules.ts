@@ -1,6 +1,19 @@
 // Azul rules shared by the browser (legal picks and lines) and the server (validation).
 import { asRecord } from './messages.ts';
-import type { Color, FloorItem, GameState, Move, PlayerBoard, PublicGameState, Result, Seat, Source } from './types.ts';
+import type {
+  Bonus,
+  Color,
+  FloorItem,
+  GameState,
+  Move,
+  Placement,
+  PlayerBoard,
+  PublicGameState,
+  Result,
+  Seat,
+  SeatSummary,
+  Source
+} from './types.ts';
 
 export const COLORS: Color[] = ['blue', 'yellow', 'red', 'black', 'cyan'];
 export const MAX_PLAYERS = 4;
@@ -76,11 +89,12 @@ export function completeRows(wall: boolean[][]): number {
   return wall.filter(row => row.every(Boolean)).length;
 }
 
-export function endGameBonus(wall: boolean[][]): number {
+export function endGameBonus(wall: boolean[][]): Bonus {
   const lines = wall.map((_, index) => index);
   const columns = lines.filter(col => wall.every(row => row[col])).length;
   const colors = COLORS.filter(color => lines.every(row => wall[row][wallColumn(row, color)])).length;
-  return completeRows(wall) * 2 + columns * 7 + colors * 10;
+  const rows = completeRows(wall);
+  return { rows, columns, colors, points: rows * 2 + columns * 7 + colors * 10 };
 }
 
 type Random = () => number;
@@ -143,6 +157,8 @@ export function createGameState(gameId: string): GameState {
     gameStatus: '',
     isGameOver: false,
     winners: [],
+    roundSummary: null,
+    undoVote: null,
     bag: [],
     lid: [],
     roundStarter: null,
@@ -220,7 +236,7 @@ export function removePlayer(state: GameState, seat: Seat, random: Random = Math
 
   // Mid-game: the board stays and is still scored, the seat is skipped from now on
   const next: GameState = { ...state, activePlayers, gameStatus: `${name} left the game` };
-  if (state.isGameOver) return next;
+  if (state.isGameOver) return activePlayers.length < 2 ? { ...next, undoVote: null } : next;
 
   if (activePlayers.length === 1) {
     const winner = activePlayers[0];
@@ -229,6 +245,7 @@ export function removePlayer(state: GameState, seat: Seat, random: Random = Math
       isGameOver: true,
       currentPlayer: null,
       winners: [winner],
+      undoVote: null,
       gameStatus: `${state.playerNames[winner]} wins! Everyone else left.`
     };
   }
@@ -236,12 +253,13 @@ export function removePlayer(state: GameState, seat: Seat, random: Random = Math
   if (state.currentPlayer === seat) {
     next.currentPlayer = nextActivePlayer(next, seat);
   }
-  return next;
+  // The next round may have been waiting only for the player who left
+  return startNextRoundIfReady(next, random);
 }
 
-export function toPublicState(state: GameState): PublicGameState {
+export function toPublicState(state: GameState, undoAvailable: boolean): PublicGameState {
   const { bag: _bag, lid: _lid, roundStarter: _roundStarter, markerHolder: _markerHolder, ...view } = state;
-  return view;
+  return { ...view, undoAvailable };
 }
 
 function isColor(item: unknown): item is Color {
@@ -269,40 +287,74 @@ function parseMove(move: unknown): Move | null {
 }
 
 // Moves each full pattern line onto the wall, then charges for the floor line.
-// `discarded` is what goes to the lid.
-function tileWall(board: PlayerBoard): { board: PlayerBoard; discarded: Color[] } {
+// `discarded` is what goes to the lid; `summary` records why the score changed.
+function tileWall(board: PlayerBoard): { board: PlayerBoard; discarded: Color[]; summary: SeatSummary } {
   const wall = board.wall.map(row => [...row]);
   const discarded: Color[] = [];
+  const placements: Placement[] = [];
   let score = board.score;
 
   const patternLines = board.patternLines.map((line, row) => {
-    if (line.color === null || line.count < row + 1) return line;
-    const col = wallColumn(row, line.color);
+    const color = line.color;
+    if (color === null || line.count < row + 1) return line;
+    const col = wallColumn(row, color);
     wall[row][col] = true;
-    score += scorePlacement(wall, row, col);
-    discarded.push(...Array<Color>(row).fill(line.color)); // one tile stays on the wall
+    const points = scorePlacement(wall, row, col);
+    placements.push({
+      row,
+      col,
+      color,
+      points,
+      rowRun: runLength(wall, row, col, 0, 1),
+      colRun: runLength(wall, row, col, 1, 0)
+    });
+    score += points;
+    discarded.push(...Array<Color>(row).fill(color)); // one tile stays on the wall
     return { color: null, count: 0 };
   });
 
-  score = Math.max(0, score - floorPenalty(board.floor));
+  const penalty = floorPenalty(board.floor);
+  score = Math.max(0, score - penalty);
   discarded.push(...board.floor.filter(isColor));
-  return { board: { patternLines, wall, floor: [], score }, discarded };
+  return {
+    board: { patternLines, wall, floor: [], score },
+    discarded,
+    summary: {
+      scoreBefore: board.score,
+      placements,
+      floor: board.floor,
+      floorPenalty: penalty,
+      bonus: null,
+      scoreAfter: score
+    }
+  };
 }
 
-function mapBoards(
-  boards: Record<Seat, PlayerBoard>,
-  change: (board: PlayerBoard) => PlayerBoard
-): Record<Seat, PlayerBoard> {
-  return Object.fromEntries(Object.entries(boards).map(([seat, board]) => [seat, change(board)]));
+function mapSeats<T, U>(record: Record<Seat, T>, change: (value: T, seat: Seat) => U): Record<Seat, U> {
+  return Object.fromEntries(Object.entries(record).map(([seat, value]) => [seat, change(value, Number(seat))]));
 }
 
 // Adds the bonuses and picks the winners among the players still in the game:
 // most points, then most complete rows; a tie on both is shared
 function endGame(state: GameState): GameState {
-  const boards = mapBoards(state.boards, board => ({ ...board, score: board.score + endGameBonus(board.wall) }));
-  const best = (seats: Seat[], measure: (board: PlayerBoard) => number): Seat[] => {
-    const top = Math.max(...seats.map(seat => measure(boards[seat])));
-    return seats.filter(seat => measure(boards[seat]) === top);
+  const boards = mapSeats(state.boards, board => ({ ...board, score: board.score + endGameBonus(board.wall).points }));
+  const unchanged = mapSeats(state.boards, (board): SeatSummary => ({
+    scoreBefore: board.score,
+    placements: [],
+    floor: [],
+    floorPenalty: 0,
+    bonus: null,
+    scoreAfter: board.score
+  }));
+  const seats = mapSeats(state.roundSummary?.seats ?? unchanged, (summary, seat): SeatSummary => ({
+    ...summary,
+    bonus: endGameBonus(boards[seat].wall),
+    scoreAfter: boards[seat].score
+  }));
+
+  const best = (among: Seat[], measure: (board: PlayerBoard) => number): Seat[] => {
+    const top = Math.max(...among.map(seat => measure(boards[seat])));
+    return among.filter(seat => measure(boards[seat]) === top);
   };
   const winners = best(best(state.activePlayers, board => board.score), board => completeRows(board.wall));
   const names = winners.map(seat => state.playerNames[seat]);
@@ -314,26 +366,40 @@ function endGame(state: GameState): GameState {
     isGameOver: true,
     currentPlayer: null,
     winners,
+    roundSummary: { round: state.round, seats, acknowledged: [] },
     gameStatus: winners.length === 1
       ? `${names[0]} wins with ${points} points!`
       : `${names.join(' and ')} share the win with ${points} points!`
   };
 }
 
-// Runs once the factories and the centre are empty
-function endRound(state: GameState, random: Random): GameState {
+// Runs once the factories and the centre are empty. The next round is not dealt until
+// every player has acknowledged the summary.
+function endRound(state: GameState): GameState {
   const lid = [...state.lid];
-  const boards = mapBoards(state.boards, board => {
-    const tiled = tileWall(board);
-    lid.push(...tiled.discarded);
-    return tiled.board;
-  });
-  const scored: GameState = { ...state, boards, lid };
+  const tiled = mapSeats(state.boards, board => tileWall(board));
+  for (const result of Object.values(tiled)) lid.push(...result.discarded);
+  const boards = mapSeats(tiled, result => result.board);
 
-  if (Object.values(boards).some(board => completeRows(board.wall) > 0)) return endGame(scored);
+  const scored: GameState = {
+    ...state,
+    boards,
+    lid,
+    currentPlayer: null,
+    roundSummary: { round: state.round, seats: mapSeats(tiled, result => result.summary), acknowledged: [] },
+    gameStatus: `Round ${state.round} scored. Waiting for everyone to continue.`
+  };
+  return Object.values(boards).some(board => completeRows(board.wall) > 0) ? endGame(scored) : scored;
+}
 
-  const dealt = deal(state.bag, lid, state.factories.length, random);
-  if (dealt.factories.every(factory => factory.length === 0)) return endGame(scored);
+// Deals the next round once every player still in the game has acknowledged the summary
+function startNextRoundIfReady(state: GameState, random: Random): GameState {
+  const summary = state.roundSummary;
+  if (!summary || state.isGameOver) return state;
+  if (!state.activePlayers.every(seat => summary.acknowledged.includes(seat))) return state;
+
+  const dealt = deal(state.bag, state.lid, state.factories.length, random);
+  if (dealt.factories.every(factory => factory.length === 0)) return endGame({ ...state, roundSummary: null });
 
   // The marker holder starts. If nobody took the marker, the same player starts again.
   const preferred = state.markerHolder ?? state.roundStarter ?? state.activePlayers[0];
@@ -341,7 +407,7 @@ function endRound(state: GameState, random: Random): GameState {
   const starterName = starter === null ? '' : state.playerNames[starter];
 
   return {
-    ...scored,
+    ...state,
     ...dealt,
     center: [],
     centerHasMarker: true,
@@ -349,13 +415,29 @@ function endRound(state: GameState, random: Random): GameState {
     roundStarter: starter,
     currentPlayer: starter,
     round: state.round + 1,
-    gameStatus: `Round ${state.round} scored. ${starterName} starts round ${state.round + 1}.`
+    roundSummary: null,
+    gameStatus: `${starterName} starts round ${state.round + 1}.`
   };
 }
 
-export function applyMove(state: GameState, seat: Seat, move: unknown, random: Random = Math.random): Result<GameState> {
+export function acknowledgeRound(state: GameState, seat: Seat, random: Random = Math.random): Result<GameState> {
+  const summary = state.roundSummary;
+  if (!summary || state.isGameOver) return { error: 'Nothing to continue' };
+  if (state.undoVote) return { error: 'An undo vote is in progress' };
+  if (summary.acknowledged.includes(seat)) return { state };
+
+  const next: GameState = {
+    ...state,
+    roundSummary: { ...summary, acknowledged: [...summary.acknowledged, seat] },
+    gameStatus: `${state.playerNames[seat]} is ready for the next round`
+  };
+  return { state: startNextRoundIfReady(next, random) };
+}
+
+export function applyMove(state: GameState, seat: Seat, move: unknown): Result<GameState> {
   if (state.isGameOver) return { error: 'The game is over' };
   if (state.activePlayers.length < 2) return { error: 'Waiting for more players' };
+  if (state.undoVote) return { error: 'An undo vote is in progress' };
   if (state.currentPlayer !== seat) return { error: 'Not your turn' };
 
   const parsed = parseMove(move);
@@ -402,6 +484,6 @@ export function applyMove(state: GameState, seat: Seat, move: unknown, random: R
   };
 
   const tableEmpty = center.length === 0 && factories.every(factory => factory.length === 0);
-  if (tableEmpty) return { state: endRound(next, random) };
+  if (tableEmpty) return { state: endRound(next) };
   return { state: { ...next, currentPlayer: nextActivePlayer(next, seat) } };
 }

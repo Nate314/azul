@@ -64,9 +64,21 @@ function handleMessage(ws: WebSocket, data: unknown): void {
     return;
   }
 
-  if (message?.type === MESSAGE_TYPES.MAKE_MOVE) {
-    const { gameId, seat } = connection;
-    respond(ws, gameId, manager.move(gameId, seat, asRecord(message.payload)?.move));
+  const { gameId, seat } = connection;
+  const payload = asRecord(message?.payload);
+  switch (message?.type) {
+    case MESSAGE_TYPES.MAKE_MOVE:
+      respond(ws, gameId, manager.move(gameId, seat, payload?.move));
+      break;
+    case MESSAGE_TYPES.ACKNOWLEDGE_ROUND:
+      respond(ws, gameId, manager.acknowledge(gameId, seat));
+      break;
+    case MESSAGE_TYPES.REQUEST_UNDO:
+      respond(ws, gameId, manager.requestUndo(gameId, seat));
+      break;
+    case MESSAGE_TYPES.VOTE_UNDO:
+      respond(ws, gameId, manager.voteUndo(gameId, seat, payload?.approve));
+      break;
   }
 }
 

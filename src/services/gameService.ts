@@ -67,6 +67,18 @@ class GameService {
     this.send({ type: MESSAGE_TYPES.MAKE_MOVE, payload: { move } });
   }
 
+  acknowledgeRound(): void {
+    this.send({ type: MESSAGE_TYPES.ACKNOWLEDGE_ROUND });
+  }
+
+  requestUndo(): void {
+    this.send({ type: MESSAGE_TYPES.REQUEST_UNDO });
+  }
+
+  voteUndo(approve: boolean): void {
+    this.send({ type: MESSAGE_TYPES.VOTE_UNDO, payload: { approve } });
+  }
+
   disconnect(): void {
     const ws = this.ws;
     this.ws = null;

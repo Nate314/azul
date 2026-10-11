@@ -35,12 +35,16 @@ flowchart TD
    - `Factories.tsx` renders the factories and the centre and turns clicks into a selection
    - `PlayerBoard.tsx` renders one player's pattern lines, wall, floor line and score, and turns clicks into moves
    - `Tile.tsx` renders one tile or the first-player marker
+   - `RoundSummary.tsx` shows why everyone scored what they did, with the Continue button
+   - `UndoVote.tsx` shows a running undo vote
+   - `Faq.tsx` is the rules and controls guide behind the FAQ button
    - `/src/hooks/useGameConnection.ts` holds the joined game's state and errors from the Game Service
 
 2. **Game Service (`/src/services/gameService.ts`)**
 
    - Manages the WebSocket connection
-   - Sends joins and moves, and passes server state updates and errors to the UI
+   - Sends joins, moves, round acknowledgements, undo requests and undo votes
+   - Passes server state updates and errors to the UI
 
 3. **Shared Rules (`/shared/rules.ts`)**
    - The wall layout, legal pattern lines, placement scoring, floor penalties and end-game bonuses
@@ -59,6 +63,8 @@ flowchart TD
 
    - Creates games, seats up to four players, and locks joining after the first move
    - Validates and applies moves with the shared rules
+   - Holds the round summary until every player has acknowledged it, then deals the next round
+   - Keeps each game's undo history and runs unanimous undo votes
    - Holds each game's full state in memory, and sends only the public view
 
 ## Hidden state
@@ -82,9 +88,24 @@ The full `GameState` includes the bag and the lid (the discard pile). `toPublicS
    Server -> All clients in the game: GAME_STATE, or GAME_ERROR to the sender
    ```
 
-   The move that empties the table also scores the round and deals the next one, so the state that comes back is already the start of the next round, or the final result.
+   The move that empties the table also scores the round, so the state that comes back carries a round summary, or the final result.
 
-3. **Disconnecting**
+3. **Between rounds**
+
+   ```
+   Each client -> Server: ACKNOWLEDGE_ROUND
+   Server -> All clients in the game: GAME_STATE (who is ready, then the next round once everyone is)
+   ```
+
+4. **Undo**
+
+   ```
+   Client -> Server: REQUEST_UNDO
+   Each client -> Server: VOTE_UNDO (approve)
+   Server -> All clients in the game: GAME_STATE (vote progress, then the restored state or the decline)
+   ```
+
+5. **Disconnecting**
    ```
    Client disconnects
    Server -> Remaining clients: GAME_STATE (player marked as left)

@@ -17,7 +17,8 @@ import {
   removePlayer,
   nextActivePlayer,
   toPublicState,
-  applyMove
+  applyMove,
+  acknowledgeRound
 } from './rules.ts';
 import type { Color, GameState, Move, PatternLine, PlayerBoard, Result, Source } from './types.ts';
 
@@ -111,11 +112,11 @@ test('floor penalties grow along the floor line', () => {
 });
 
 test('end-game bonuses: 2 per row, 7 per column, 10 per colour', () => {
-  assert.equal(endGameBonus(wallOf()), 0);
-  assert.equal(endGameBonus(wallOf(...fullRow(0))), 2);
-  assert.equal(endGameBonus(wallOf(...fullColumn(0))), 7);
-  assert.equal(endGameBonus(wallOf([0, 0], [1, 1], [2, 2], [3, 3], [4, 4])), 10); // every blue
-  assert.equal(endGameBonus(wallOf(...[0, 1, 2, 3, 4].flatMap(fullRow))), 95);
+  assert.equal(endGameBonus(wallOf()).points, 0);
+  assert.deepEqual(endGameBonus(wallOf(...fullRow(0))), { rows: 1, columns: 0, colors: 0, points: 2 });
+  assert.deepEqual(endGameBonus(wallOf(...fullColumn(0))), { rows: 0, columns: 1, colors: 0, points: 7 });
+  assert.equal(endGameBonus(wallOf([0, 0], [1, 1], [2, 2], [3, 3], [4, 4])).points, 10); // every blue
+  assert.deepEqual(endGameBonus(wallOf(...[0, 1, 2, 3, 4].flatMap(fullRow))), { rows: 5, columns: 5, colors: 5, points: 95 });
   assert.equal(completeRows(wallOf(...fullRow(0), ...fullRow(3), [1, 1])), 2);
 });
 
@@ -198,7 +199,8 @@ test('turn order skips empty seats and wraps', () => {
 });
 
 test('the public state has no bag, lid or bookkeeping', () => {
-  const view = toPublicState(lobby('A', 'B'));
+  const view = toPublicState(lobby('A', 'B'), true);
+  assert.equal(view.undoAvailable, true);
   assert.equal('bag' in view, false);
   assert.equal('lid' in view, false);
   assert.equal('roundStarter' in view, false);
@@ -223,6 +225,8 @@ function game(overrides: Partial<GameState> = {}): GameState {
     gameStatus: '',
     isGameOver: false,
     winners: [],
+    roundSummary: null,
+    undoVote: null,
     bag: Array<Color>(40).fill('black'),
     lid: [],
     roundStarter: 1,
@@ -350,6 +354,11 @@ test('malformed moves are refused', () => {
   }
 });
 
+// Every player still in the game acknowledges the round summary
+function continued(state: GameState, random?: () => number): GameState {
+  return state.activePlayers.reduce((current, seat) => ok(acknowledgeRound(current, seat, random)), state);
+}
+
 test('the round ends when the table is empty: lines tile the wall and the floor costs points', () => {
   const state = game({
     factories: [['blue', 'blue', 'blue', 'blue'], [], [], [], []],
@@ -362,15 +371,57 @@ test('the round ends when the table is empty: lines tile the wall and the floor 
       2: board()
     }
   });
-  const next = ok(applyMove(state, 1, take(factory(0), 'blue', 3)));
-  const mine = next.boards[1];
+  const scored = ok(applyMove(state, 1, take(factory(0), 'blue', 3)));
+  const mine = scored.boards[1];
 
   assert.deepEqual(mine.wall, wallOf([1, 3], [3, 3]));
   assert.equal(mine.score, 1); // 1 for red, 1 for blue, minus 1 for the floor
   assert.deepEqual(mine.patternLines, linesOf({ 2: { color: 'yellow', count: 1 } })); // unfinished line stays
   assert.deepEqual(mine.floor, []);
-  assert.deepEqual([...next.lid].sort(), ['blue', 'blue', 'blue', 'red', 'red']);
+  assert.deepEqual([...scored.lid].sort(), ['blue', 'blue', 'blue', 'red', 'red']);
 
+  // Nothing is dealt until everyone has seen the summary
+  assert.equal(scored.round, 1);
+  assert.equal(scored.currentPlayer, null);
+  assert.ok(scored.factories.every(tiles => tiles.length === 0));
+  assert.equal(scored.isGameOver, false);
+  assert.equal(scored.gameStatus, 'Round 1 scored. Waiting for everyone to continue.');
+  assert.deepEqual(scored.roundSummary, {
+    round: 1,
+    acknowledged: [],
+    seats: {
+      1: {
+        scoreBefore: 0,
+        placements: [
+          { row: 1, col: 3, color: 'red', points: 1, rowRun: 1, colRun: 1 },
+          { row: 3, col: 3, color: 'blue', points: 1, rowRun: 1, colRun: 1 }
+        ],
+        floor: ['red'],
+        floorPenalty: 1,
+        bonus: null,
+        scoreAfter: 1
+      },
+      2: { scoreBefore: 0, placements: [], floor: [], floorPenalty: 0, bonus: null, scoreAfter: 0 }
+    }
+  });
+});
+
+test('the next round is dealt once every player has acknowledged the summary', () => {
+  const scored = ok(applyMove(
+    game({ factories: [['blue'], [], [], [], []], roundStarter: 2 }),
+    1,
+    take(factory(0), 'blue', 4)
+  ));
+  assert.deepEqual(applyMove(scored, 1, take(factory(0), 'blue', 4)), { error: 'Not your turn' });
+
+  const one = ok(acknowledgeRound(scored, 2));
+  assert.deepEqual(one.roundSummary?.acknowledged, [2]);
+  assert.equal(one.round, 1);
+  assert.equal(one.gameStatus, 'Bob is ready for the next round');
+  assert.equal(ok(acknowledgeRound(one, 2)), one); // acknowledging twice changes nothing
+
+  const next = ok(acknowledgeRound(one, 1));
+  assert.equal(next.roundSummary, null);
   assert.equal(next.round, 2);
   assert.ok(next.factories.every(tiles => tiles.length === 4));
   assert.equal(next.bag.length, 20);
@@ -378,8 +429,27 @@ test('the round ends when the table is empty: lines tile the wall and the floor 
   assert.equal(next.markerHolder, null);
   assert.equal(next.currentPlayer, 2); // nobody took the marker, so the same player starts again
   assert.equal(next.roundStarter, 2);
-  assert.equal(next.isGameOver, false);
-  assert.equal(next.gameStatus, 'Round 1 scored. Bob starts round 2.');
+  assert.equal(next.gameStatus, 'Bob starts round 2.');
+
+  assert.deepEqual(acknowledgeRound(next, 1), { error: 'Nothing to continue' });
+  assert.deepEqual(acknowledgeRound(game(), 1), { error: 'Nothing to continue' });
+});
+
+test('a player leaving no longer holds up the next round', () => {
+  const three = game({
+    factories: [['blue'], [], [], [], [], [], []],
+    activePlayers: [1, 2, 3],
+    playerNames: { 1: 'Alice', 2: 'Bob', 3: 'Cara' },
+    boards: { 1: board(), 2: board(), 3: board() }
+  });
+  const scored = ok(applyMove(three, 1, take(factory(0), 'blue', 4)));
+  const waiting = ok(acknowledgeRound(ok(acknowledgeRound(scored, 1)), 2));
+  assert.equal(waiting.round, 1);
+
+  const next = removePlayer(waiting, 3);
+  assert.equal(next.round, 2);
+  assert.equal(next.roundSummary, null);
+  assert.equal(next.currentPlayer, 1);
 });
 
 test('tiles placed next to each other in one round score as a run', () => {
@@ -393,6 +463,10 @@ test('tiles placed next to each other in one round score as a run', () => {
   const next = ok(applyMove(state, 1, take(factory(0), 'red', 4)));
   assert.deepEqual(next.boards[1].wall, wallOf([0, 0], [1, 0]));
   assert.equal(next.boards[1].score, 3); // 1 for the first, 2 for the one below it
+  assert.deepEqual(next.roundSummary?.seats[1].placements, [
+    { row: 0, col: 0, color: 'blue', points: 1, rowRun: 1, colRun: 1 },
+    { row: 1, col: 0, color: 'cyan', points: 2, rowRun: 1, colRun: 2 }
+  ]);
 });
 
 test('a score never drops below zero', () => {
@@ -402,6 +476,10 @@ test('a score never drops below zero', () => {
   });
   const next = ok(applyMove(state, 1, take(factory(0), 'red', 'floor')));
   assert.equal(next.boards[1].score, 0);
+  const summary = next.roundSummary?.seats[1];
+  assert.equal(summary?.floorPenalty, 14);
+  assert.equal(summary?.scoreBefore, 3);
+  assert.equal(summary?.scoreAfter, 0);
 });
 
 test('the marker holder starts the next round', () => {
@@ -411,10 +489,10 @@ test('the marker holder starts the next round', () => {
     centerHasMarker: false,
     boards: { 1: board(), 2: board({ floor: ['first'] }) }
   });
-  assert.equal(ok(applyMove(taken, 1, take(factory(0), 'red', 4))).currentPlayer, 2);
+  assert.equal(continued(ok(applyMove(taken, 1, take(factory(0), 'red', 4)))).currentPlayer, 2);
 
   const lastPick = game({ center: ['red'], roundStarter: 2 });
-  const next = ok(applyMove(lastPick, 1, take(CENTER, 'red', 4)));
+  const next = continued(ok(applyMove(lastPick, 1, take(CENTER, 'red', 4))));
   assert.equal(next.currentPlayer, 1);
   assert.equal(next.roundStarter, 1);
   assert.equal(next.centerHasMarker, true);
@@ -429,7 +507,7 @@ test('the next active seat starts when the marker holder has left', () => {
     markerHolder: 2,
     centerHasMarker: false
   });
-  const next = ok(applyMove(state, 1, take(factory(0), 'red', 4)));
+  const next = continued(ok(applyMove(state, 1, take(factory(0), 'red', 4))));
   assert.equal(next.currentPlayer, 3);
   assert.deepEqual(next.boards[2].floor, []); // boards of players who left are still scored
 });
@@ -440,7 +518,7 @@ test('the lid refills the bag when it runs out', () => {
     bag: ['red', 'red'],
     lid: Array<Color>(30).fill('yellow')
   });
-  const next = ok(applyMove(state, 1, take(factory(0), 'blue', 'floor')));
+  const next = continued(ok(applyMove(state, 1, take(factory(0), 'blue', 'floor'))));
   assert.equal(next.factories.flat().length, 20);
   assert.deepEqual(next.factories[0].slice(0, 2), ['red', 'red']);
   assert.equal(next.bag.length, 13); // 30 yellow and the blue from the floor, less the 18 drawn
@@ -449,12 +527,24 @@ test('the lid refills the bag when it runs out', () => {
 
 test('factories stay short when the tiles run out, and the game ends when none are left', () => {
   const short = game({ factories: [['blue'], [], [], [], []], bag: ['red'] });
-  const next = ok(applyMove(short, 1, take(factory(0), 'blue', 4)));
+  const next = continued(ok(applyMove(short, 1, take(factory(0), 'blue', 4))));
   assert.deepEqual(next.factories, [['red'], [], [], [], []]);
   assert.equal(next.isGameOver, false);
 
   const none = game({ factories: [['blue'], [], [], [], []], bag: [] });
-  assert.equal(ok(applyMove(none, 1, take(factory(0), 'blue', 4))).isGameOver, true);
+  const over = continued(ok(applyMove(none, 1, take(factory(0), 'blue', 4))));
+  assert.equal(over.isGameOver, true);
+  assert.deepEqual(over.roundSummary?.seats[1].bonus, { rows: 0, columns: 0, colors: 0, points: 0 });
+});
+
+test('moves and acknowledgements wait for an undo vote', () => {
+  const voting = { requestedBy: 2, votes: { 2: true } };
+  assert.deepEqual(
+    applyMove(game({ factories: OPENING, undoVote: voting }), 1, take(factory(0), 'blue', 1)),
+    { error: 'An undo vote is in progress' }
+  );
+  const scored = ok(applyMove(game({ factories: [['blue'], [], [], [], []] }), 1, take(factory(0), 'blue', 4)));
+  assert.deepEqual(acknowledgeRound({ ...scored, undoVote: voting }, 1), { error: 'An undo vote is in progress' });
 });
 
 test('a complete wall row ends the game after the round, with bonuses', () => {
@@ -470,6 +560,15 @@ test('a complete wall row ends the game after the round, with bonuses', () => {
   assert.equal(next.round, 1);
   assert.ok(next.factories.every(tiles => tiles.length === 0));
   assert.equal(next.gameStatus, 'Alice wins with 7 points!');
+  assert.deepEqual(next.roundSummary?.seats[1], {
+    scoreBefore: 0,
+    placements: [{ row: 0, col: 0, color: 'blue', points: 5, rowRun: 5, colRun: 1 }],
+    floor: [],
+    floorPenalty: 0,
+    bonus: { rows: 1, columns: 0, colors: 0, points: 2 },
+    scoreAfter: 7
+  });
+  assert.equal(next.roundSummary?.seats[2].scoreAfter, 6);
 });
 
 test('a tie on points goes to the player with more complete rows, or is shared', () => {
@@ -538,7 +637,9 @@ test('a whole game keeps all 100 tiles and reaches an end', () => {
     const source = pick(sources);
     const color = pick(sourceColors(state, source));
     const lines = legalLines(state.boards[seat], color);
-    state = ok(applyMove(state, seat, take(source, color, lines.length > 0 ? pick(lines) : 'floor'), random));
+    state = ok(applyMove(state, seat, take(source, color, lines.length > 0 ? pick(lines) : 'floor')));
+    assert.equal(countTiles(state), 100);
+    if (!state.isGameOver && state.roundSummary) state = continued(state, random);
     assert.equal(countTiles(state), 100);
   }
 

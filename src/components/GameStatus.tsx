@@ -6,9 +6,11 @@ type GameStatusProps = {
   hint: string | null;
 };
 
-function turnMessage({ currentPlayer, playerNames, activePlayers, started, isGameOver, round }: PublicGameState): string {
+function turnMessage(state: PublicGameState): string {
+  const { currentPlayer, playerNames, activePlayers, started, isGameOver, round, roundSummary } = state;
   const currentName = currentPlayer === null ? '' : playerNames[currentPlayer];
   if (isGameOver) return 'Game over';
+  if (roundSummary) return `Round ${round} is over`;
   if (activePlayers.length < 2) return 'Waiting for at least one more player';
   if (!started) return `${currentName} goes first. Joining closes after the first move.`;
   return `Round ${round}: ${currentName}'s turn`;
