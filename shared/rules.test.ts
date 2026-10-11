@@ -11,9 +11,14 @@ import {
   scorePlacement,
   floorPenalty,
   completeRows,
-  endGameBonus
+  endGameBonus,
+  createGameState,
+  addPlayer,
+  removePlayer,
+  nextActivePlayer,
+  toPublicState
 } from './rules.ts';
-import type { PatternLine, PlayerBoard } from './types.ts';
+import type { GameState, PatternLine, PlayerBoard } from './types.ts';
 
 function wallOf(...cells: [number, number][]): boolean[][] {
   const wall = Array.from({ length: 5 }, () => Array<boolean>(5).fill(false));
@@ -111,4 +116,91 @@ test('end-game bonuses: 2 per row, 7 per column, 10 per colour', () => {
   assert.equal(endGameBonus(wallOf([0, 0], [1, 1], [2, 2], [3, 3], [4, 4])), 10); // every blue
   assert.equal(endGameBonus(wallOf(...[0, 1, 2, 3, 4].flatMap(fullRow))), 95);
   assert.equal(completeRows(wallOf(...fullRow(0), ...fullRow(3), [1, 1])), 2);
+});
+
+function lobby(...names: string[]): GameState {
+  let state = createGameState('g');
+  for (const name of names) {
+    const result = addPlayer(state, name);
+    if ('error' in result) assert.fail(result.error);
+    state = result.state;
+  }
+  return state;
+}
+
+// Every tile in play, wherever it is; the first-player marker is not a tile
+function countTiles(state: GameState): number {
+  const onBoards = Object.values(state.boards).reduce((sum, b) =>
+    sum +
+    b.patternLines.reduce((count, line) => count + line.count, 0) +
+    b.wall.flat().filter(Boolean).length +
+    b.floor.filter(item => item !== 'first').length, 0);
+  return state.bag.length + state.lid.length + state.center.length + state.factories.flat().length + onBoards;
+}
+
+test('one player waits at an empty table', () => {
+  const state = lobby('Alice');
+  assert.deepEqual(state.activePlayers, [1]);
+  assert.equal(state.currentPlayer, 1);
+  assert.deepEqual(state.factories, []);
+  assert.equal(state.centerHasMarker, false);
+  assert.equal(state.started, false);
+  assert.deepEqual(Object.keys(state.boards), ['1']);
+});
+
+test('the table is dealt for the number of players', () => {
+  const two = lobby('Alice', 'Bob');
+  assert.equal(two.factories.length, 5);
+  assert.ok(two.factories.every(factory => factory.length === 4));
+  assert.equal(two.bag.length, 80);
+  assert.equal(two.centerHasMarker, true);
+  assert.equal(two.currentPlayer, 1);
+  assert.equal(two.roundStarter, 1);
+  assert.equal(two.round, 1);
+  assert.equal(two.gameStatus, 'Bob joined (2/4 players)');
+  assert.equal(countTiles(two), 100);
+
+  assert.equal(lobby('A', 'B', 'C').factories.length, 7);
+  const four = lobby('A', 'B', 'C', 'D');
+  assert.equal(four.factories.length, 9);
+  assert.equal(four.bag.length, 64);
+  for (const color of COLORS) {
+    assert.equal([...four.bag, ...four.factories.flat()].filter(tile => tile === color).length, 20);
+  }
+});
+
+test('a fifth player and a late player are refused', () => {
+  assert.deepEqual(addPlayer(lobby('A', 'B', 'C', 'D'), 'E'), { error: 'Game is full' });
+  assert.deepEqual(addPlayer({ ...lobby('A', 'B'), started: true }, 'C'), { error: 'Game already in progress' });
+});
+
+test('leaving the lobby frees the seat and deals afresh', () => {
+  const state = removePlayer(lobby('A', 'B', 'C'), 2);
+  assert.deepEqual(state.activePlayers, [1, 3]);
+  assert.deepEqual(state.playerNames, { 1: 'A', 3: 'C' });
+  assert.deepEqual(Object.keys(state.boards), ['1', '3']);
+  assert.equal(state.factories.length, 5);
+  assert.equal(countTiles(state), 100);
+
+  const rejoined = addPlayer(state, 'D');
+  if ('error' in rejoined) assert.fail(rejoined.error);
+  assert.equal(rejoined.seat, 2);
+
+  assert.deepEqual(removePlayer(lobby('A', 'B'), 1).factories, []);
+});
+
+test('turn order skips empty seats and wraps', () => {
+  assert.equal(nextActivePlayer({ activePlayers: [1, 3, 4] }, 1), 3);
+  assert.equal(nextActivePlayer({ activePlayers: [1, 3, 4] }, 4), 1);
+  assert.equal(nextActivePlayer({ activePlayers: [2] }, 2), 2);
+  assert.equal(nextActivePlayer({ activePlayers: [] }, 1), null);
+});
+
+test('the public state has no bag, lid or bookkeeping', () => {
+  const view = toPublicState(lobby('A', 'B'));
+  assert.equal('bag' in view, false);
+  assert.equal('lid' in view, false);
+  assert.equal('roundStarter' in view, false);
+  assert.equal('markerHolder' in view, false);
+  assert.equal(view.factories.length, 5);
 });
