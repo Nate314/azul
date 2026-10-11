@@ -63,8 +63,9 @@ azul/
 
 Players join by game ID and name and take the lowest free seat (1 to 4). While the game has not
 started, each join or leave deals afresh for the current player count: a full shuffled bag, the
-right number of factories filled with 4 tiles each, the marker in the centre, empty boards. The
-lowest seat takes the first turn. A move needs at least two players. The first move sets
+right number of factories filled with 4 tiles each, the marker in the centre, empty boards. With
+only one player seated, nothing is dealt and the table is empty. The lowest seat takes the first
+turn. A move needs at least two players. The first move sets
 `started` and locks joining.
 
 ### A turn
