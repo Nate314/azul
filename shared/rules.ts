@@ -1,5 +1,6 @@
 // Azul rules shared by the browser (legal picks and lines) and the server (validation).
-import type { Color, FloorItem, GameState, PlayerBoard, PublicGameState, Seat, Source } from './types.ts';
+import { asRecord } from './messages.ts';
+import type { Color, FloorItem, GameState, Move, PlayerBoard, PublicGameState, Result, Seat, Source } from './types.ts';
 
 export const COLORS: Color[] = ['blue', 'yellow', 'red', 'black', 'cyan'];
 export const MAX_PLAYERS = 4;
@@ -241,4 +242,166 @@ export function removePlayer(state: GameState, seat: Seat, random: Random = Math
 export function toPublicState(state: GameState): PublicGameState {
   const { bag: _bag, lid: _lid, roundStarter: _roundStarter, markerHolder: _markerHolder, ...view } = state;
   return view;
+}
+
+function isColor(item: unknown): item is Color {
+  return COLORS.some(color => color === item);
+}
+
+function isLine(value: unknown): value is number | 'floor' {
+  return value === 'floor' ||
+    (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < LINE_COUNT);
+}
+
+// Reads a move as it arrives over the network, or null if it is not shaped like one
+function parseMove(move: unknown): Move | null {
+  const input = asRecord(move);
+  const source = asRecord(input?.source);
+  const color = input?.color;
+  const line = input?.line;
+  if (!source || !isColor(color) || !isLine(line)) return null;
+
+  if (source.type === 'center') return { source: { type: 'center' }, color, line };
+  if (source.type === 'factory' && typeof source.index === 'number' && Number.isInteger(source.index)) {
+    return { source: { type: 'factory', index: source.index }, color, line };
+  }
+  return null;
+}
+
+// Moves each full pattern line onto the wall, then charges for the floor line.
+// `discarded` is what goes to the lid.
+function tileWall(board: PlayerBoard): { board: PlayerBoard; discarded: Color[] } {
+  const wall = board.wall.map(row => [...row]);
+  const discarded: Color[] = [];
+  let score = board.score;
+
+  const patternLines = board.patternLines.map((line, row) => {
+    if (line.color === null || line.count < row + 1) return line;
+    const col = wallColumn(row, line.color);
+    wall[row][col] = true;
+    score += scorePlacement(wall, row, col);
+    discarded.push(...Array<Color>(row).fill(line.color)); // one tile stays on the wall
+    return { color: null, count: 0 };
+  });
+
+  score = Math.max(0, score - floorPenalty(board.floor));
+  discarded.push(...board.floor.filter(isColor));
+  return { board: { patternLines, wall, floor: [], score }, discarded };
+}
+
+function mapBoards(
+  boards: Record<Seat, PlayerBoard>,
+  change: (board: PlayerBoard) => PlayerBoard
+): Record<Seat, PlayerBoard> {
+  return Object.fromEntries(Object.entries(boards).map(([seat, board]) => [seat, change(board)]));
+}
+
+// Adds the bonuses and picks the winners among the players still in the game:
+// most points, then most complete rows; a tie on both is shared
+function endGame(state: GameState): GameState {
+  const boards = mapBoards(state.boards, board => ({ ...board, score: board.score + endGameBonus(board.wall) }));
+  const best = (seats: Seat[], measure: (board: PlayerBoard) => number): Seat[] => {
+    const top = Math.max(...seats.map(seat => measure(boards[seat])));
+    return seats.filter(seat => measure(boards[seat]) === top);
+  };
+  const winners = best(best(state.activePlayers, board => board.score), board => completeRows(board.wall));
+  const names = winners.map(seat => state.playerNames[seat]);
+  const points = boards[winners[0]].score;
+
+  return {
+    ...state,
+    boards,
+    isGameOver: true,
+    currentPlayer: null,
+    winners,
+    gameStatus: winners.length === 1
+      ? `${names[0]} wins with ${points} points!`
+      : `${names.join(' and ')} share the win with ${points} points!`
+  };
+}
+
+// Runs once the factories and the centre are empty
+function endRound(state: GameState, random: Random): GameState {
+  const lid = [...state.lid];
+  const boards = mapBoards(state.boards, board => {
+    const tiled = tileWall(board);
+    lid.push(...tiled.discarded);
+    return tiled.board;
+  });
+  const scored: GameState = { ...state, boards, lid };
+
+  if (Object.values(boards).some(board => completeRows(board.wall) > 0)) return endGame(scored);
+
+  const dealt = deal(state.bag, lid, state.factories.length, random);
+  if (dealt.factories.every(factory => factory.length === 0)) return endGame(scored);
+
+  // The marker holder starts. If nobody took the marker, the same player starts again.
+  const preferred = state.markerHolder ?? state.roundStarter ?? state.activePlayers[0];
+  const starter = state.activePlayers.includes(preferred) ? preferred : nextActivePlayer(state, preferred);
+  const starterName = starter === null ? '' : state.playerNames[starter];
+
+  return {
+    ...scored,
+    ...dealt,
+    center: [],
+    centerHasMarker: true,
+    markerHolder: null,
+    roundStarter: starter,
+    currentPlayer: starter,
+    round: state.round + 1,
+    gameStatus: `Round ${state.round} scored. ${starterName} starts round ${state.round + 1}.`
+  };
+}
+
+export function applyMove(state: GameState, seat: Seat, move: unknown, random: Random = Math.random): Result<GameState> {
+  if (state.isGameOver) return { error: 'The game is over' };
+  if (state.activePlayers.length < 2) return { error: 'Waiting for more players' };
+  if (state.currentPlayer !== seat) return { error: 'Not your turn' };
+
+  const parsed = parseMove(move);
+  if (!parsed) return { error: 'Invalid move' };
+  const { source, color, line } = parsed;
+
+  const tiles = sourceTiles(state, source);
+  const count = tiles.filter(tile => tile === color).length;
+  if (count === 0) return { error: 'No tiles of that colour there' };
+
+  const board = state.boards[seat];
+  if (line !== 'floor' && !canPlaceOnLine(board, line, color)) return { error: 'Those tiles cannot go on that line' };
+
+  const fromFactory = source.type === 'factory';
+  const rest = tiles.filter(tile => tile !== color);
+  const takesMarker = !fromFactory && state.centerHasMarker;
+  const factories = fromFactory
+    ? state.factories.map((factory, index) => (index === source.index ? [] : factory))
+    : state.factories;
+  const center = fromFactory ? [...state.center, ...rest] : rest;
+
+  const placed = line === 'floor' ? 0 : Math.min(count, line + 1 - board.patternLines[line].count);
+  const patternLines = board.patternLines.map((patternLine, index) =>
+    index === line ? { color, count: patternLine.count + placed } : patternLine);
+
+  // The marker goes down first; whatever does not fit on the floor line is discarded
+  const dropped: FloorItem[] = [...(takesMarker ? ['first' as const] : []), ...Array<Color>(count - placed).fill(color)];
+  const room = FLOOR_PENALTIES.length - board.floor.length;
+  const floor = [...board.floor, ...dropped.slice(0, room)];
+  const lid = [...state.lid, ...dropped.slice(room).filter(isColor)];
+
+  const where = fromFactory ? `factory ${source.index + 1}` : 'the centre';
+  const next: GameState = {
+    ...state,
+    started: true, // Locks joining
+    factories,
+    center,
+    centerHasMarker: state.centerHasMarker && !takesMarker,
+    markerHolder: takesMarker ? seat : state.markerHolder,
+    lid,
+    boards: { ...state.boards, [seat]: { ...board, patternLines, floor } },
+    lastMove: { playerNumber: seat, source, color, count, line },
+    gameStatus: `${state.playerNames[seat]} took ${count} ${color} from ${where}`
+  };
+
+  const tableEmpty = center.length === 0 && factories.every(factory => factory.length === 0);
+  if (tableEmpty) return { state: endRound(next, random) };
+  return { state: { ...next, currentPlayer: nextActivePlayer(next, seat) } };
 }
