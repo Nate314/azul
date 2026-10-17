@@ -1,5 +1,7 @@
 # Azul Multiplayer Game
 
+> **Deprecated:** this game now lives in [Nate314/multiplayer-tabletop-games](https://github.com/Nate314/multiplayer-tabletop-games).
+
 A web-based implementation of the Azul board game for two to four players.
 
 ## Setup and Running
